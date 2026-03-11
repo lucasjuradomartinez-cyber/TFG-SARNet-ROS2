@@ -1,0 +1,75 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image as ROSImage
+from cv_bridge import CvBridge
+import torch
+import numpy as np
+import cv2
+import os
+from PIL import Image as PILImage
+
+# Importamos tu arquitectura y la paleta de colores del paper 
+from .U_Net_SE_V2 import UNet
+from .util import get_palette #paleta de colores para que la salida no sea solo números, sino una imagen coloreada.
+
+class SARNetSegmentation(Node):
+    def __init__(self):
+        super().__init__('sarnet_segmentation')
+        
+        # Configuración según el paper SARNet 
+        self.n_class = 12 
+        self.input_size = (640, 480) 
+        self.bridge = CvBridge() #Para la traducción entre como ROS2 entiende las imagenes (sensor_msgs/Image) y como las entiende PyTorch y OpenCV
+        self.palette = get_palette() 
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") #Detecta automáticamente si hay una GPU disponible (cuda)
+        self.get_logger().info(f"Procesando en: {self.device}")
+
+        # Cargar modelo con pesos entrenados
+        self.model = UNet(self.n_class).to(self.device)
+        path = os.path.join(os.path.dirname(__file__), 'weights', 'checkpoint_desde0_v3_0.7033_0.3449.pt')
+        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        self.model.eval() #Para decir a PyTorch que no estamos entrenando, sino solo usando la red (congela capas como Dropout o BatchNorm).
+        self.get_logger().info("SARNet cargada y lista.")
+
+        # Topics: Suscribirse a cámara y publicar segmentación
+        self.sub = self.create_subscription(ROSImage, '/image_raw', self.callback, 10)
+        self.pub = self.create_publisher(ROSImage, '/sarnet/mask', 10)
+
+    def callback(self, msg):
+        # Conversión y preprocesamiento 
+        cv_img = self.bridge.imgmsg_to_cv2(msg, "bgr8") #ROS2 transmite las imágenes en un formato de mensaje binario (sensor_msgs/Image). Este comando usa la librería cv_bridge para convertir ese mensaje en una matriz de OpenCV. El parámetro "bgr8" le dice que interprete los colores en el orden Azul-Verde-Rojo, que es el estándar de OpenCV.
+        img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB) #Color: Invierto los canales para PyTorch
+        pil_img = PILImage.fromarray(img_rgb).resize(self.input_size) #Tamaño: Las redes neuronales tienen una "ventana de entrada" fija (en tu caso, 640x480). Si la cámara enviara una imagen 4K, la red no sabría qué hacer; por eso forzamos el reescalado con resize
+        
+        img_tensor = torch.from_numpy(np.array(pil_img).transpose(2,0,1)).float().div(255.0).unsqueeze(0).to(self.device)
+            #5 Operaciones
+                #1. transpose(2,0,1): Las imágenes suelen guardarse como (Alto, Ancho, Canales). Sin embargo, PyTorch exige el formato (Canales, Alto, Ancho). Esta función "mueve" las dimensiones para que los colores vayan primero.
+
+                #2. float(): Cambia los números de enteros (0 a 255) a números decimales. La IA necesita decimales para realizar sus cálculos internos.
+
+                #3. div(255.0) (Normalización): Esta es una técnica estándar. Al dividir entre 255, todos los píxeles pasan a valer un número entre 0.0 y 1.0. Esto ayuda a que la red neuronal sea más estable y aprenda mejor.
+
+                #4. unsqueeze(0): Añade una dimensión extra al principio llamada "Batch Size". PyTorch no espera una imagen, sino una "lista de imágenes". Aunque solo enviemos una, debe ir en formato de lista: (1, Canales, Alto, Ancho).
+
+                #5. to(self.device): Esta es la clave de la Jetson Orin. Envía todos estos datos de la memoria RAM principal (CPU) a la memoria de video de la tarjeta gráfica (GPU/CUDA). A partir de aquí, el procesamiento es ultra rápido.
+
+
+        # Inferencia
+        with torch.no_grad(): #Ya que no estamos entrenando que no calcule gradientes
+            output = self.model(img_tensor) #Paso el tenspor de la imagen por todas las capas de la SARNet
+            pred = output.argmax(1).squeeze(0).cpu().numpy() #La salida (output) tiene 12 capas (una por cada clase de objeto). argmax(1) analiza cada píxel y se queda con el número de la capa que tenga el valor más alto. Si el valor más alto está en la capa 0, ese píxel se marca como "Asfalto".
+
+        # Colorear máscara 
+        mask_color = np.zeros((self.input_size[1], self.input_size[0], 3), dtype=np.uint8)
+        for i, color in enumerate(self.palette):
+            mask_color[pred == i] = color
+
+        # Publicar resultado
+        self.pub.publish(self.bridge.cv2_to_imgmsg(mask_color, "rgb8"))
+
+def main():
+    rclpy.init() #Encendido de todo
+    node = SARNetSegmentation()
+    rclpy.spin(node) #Bucle infinito del nodo
+    rclpy.shutdown() #Apagado (solos e ejecuta al hacer Ctrl+C)
