@@ -8,9 +8,11 @@ import cv2
 import os
 from PIL import Image as PILImage
 
+from ament_index_python.packages import get_package_share_directory
+
 # Importamos tu arquitectura y la paleta de colores del paper 
-from .U_Net_SE_V2 import UNet
-from .util import get_palette #paleta de colores para que la salida no sea solo números, sino una imagen coloreada.
+from sarnet_py.U_Net_SE_V2 import UNet
+from sarnet_py.util import get_palette #paleta de colores para que la salida no sea solo números, sino una imagen coloreada.
 
 class SARNetSegmentation(Node):
     def __init__(self):
@@ -22,19 +24,20 @@ class SARNetSegmentation(Node):
         self.bridge = CvBridge() #Para la traducción entre como ROS2 entiende las imagenes (sensor_msgs/Image) y como las entiende PyTorch y OpenCV
         self.palette = get_palette() 
         
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") #Detecta automáticamente si hay una GPU disponible (cuda)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") #Detecta automáticamente si hay una GPU disponible (cuda), si no usara esto, el código se ejecutaría en la CPU y no iría a 34 FPS, sino probablemente a 1 o 2 FPS.
         self.get_logger().info(f"Procesando en: {self.device}")
 
         # Cargar modelo con pesos entrenados
         self.model = UNet(self.n_class).to(self.device)
-        path = os.path.join(os.path.dirname(__file__), 'weights', 'checkpoint_desde0_v3_0.7033_0.3449.pt')
+        package_share_directory = get_package_share_directory('sarnet_py')
+        path = os.path.join(package_share_directory, 'weights', 'checkpoint_desde0_v3_0.7033_0.3449.pt')
         self.model.load_state_dict(torch.load(path, map_location=self.device))
         self.model.eval() #Para decir a PyTorch que no estamos entrenando, sino solo usando la red (congela capas como Dropout o BatchNorm).
         self.get_logger().info("SARNet cargada y lista.")
 
         # Topics: Suscribirse a cámara y publicar segmentación
-        self.sub = self.create_subscription(ROSImage, '/zed/zed_node/rgb/color/rect/image', self.callback, 10)
-        self.pub = self.create_publisher(ROSImage, '/sarnet/mask', 10)
+        self.sub = self.create_subscription(ROSImage, '/zed/zed_node/rgb/color/rect/image', self.callback, 1)
+        self.pub = self.create_publisher(ROSImage, '/sarnet/mask', 1)
 
     def callback(self, msg):
         # Conversión y preprocesamiento 
@@ -66,7 +69,7 @@ class SARNetSegmentation(Node):
             mask_color[pred == i] = color
 
         # Publicar resultado
-        self.pub.publish(self.bridge.cv2_to_imgmsg(mask_color, "rgb8"))
+        self.pub.publish(self.bridge.cv2_to_imgmsg(mask_color, "rgb8")) #Una vez que la red ha segmentado la imagen y la he coloreado tomo la matriz coloreada de Python y la empaqueto como un mensaje de ROS2 para publicarla y poder visualizarla en RQT
 
 def main():
     rclpy.init() #Encendido de todo

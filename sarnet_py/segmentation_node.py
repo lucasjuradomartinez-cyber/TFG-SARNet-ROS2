@@ -33,8 +33,8 @@ class SARNetSegmentation(Node):
         self.get_logger().info("SARNet cargada y lista.")
 
         # Topics: Suscribirse a cámara y publicar segmentación
-        self.sub = self.create_subscription(ROSImage, '/image_raw', self.callback, 10)
-        self.pub = self.create_publisher(ROSImage, '/sarnet/mask', 10)
+        self.sub = self.create_subscription(ROSImage, '/image_raw', self.callback, 1)
+        self.pub = self.create_publisher(ROSImage, '/sarnet/mask', 1)
 
     def callback(self, msg):
         # Conversión y preprocesamiento 
