@@ -129,32 +129,61 @@ class SARNetSegmentation(Node):
         fx, fy = self.latest_info_msg.k[0], self.latest_info_msg.k[4]
         cx, cy = self.latest_info_msg.k[2], self.latest_info_msg.k[5]
 
+        # !! LA NUEVA LÓGICA PARA MÚLTIPLES PERSONAS, FUSIÓN DE CLASES Y ÁNGULO !!
+        first_responder_class_id = 1
         civilian_class_id = 2 
-        civilian_mask = (pred == civilian_class_id)
 
-        if np.any(civilian_mask):
-            y_coords, x_coords = np.where(civilian_mask)
-            
-            center_x = int(np.mean(x_coords))
-            center_y = int(np.mean(y_coords))
+        # 1. Crear máscara combinada de "personas" (civiles + rescatistas)
+        people_mask = np.logical_or(pred == first_responder_class_id, pred == civilian_class_id).astype(np.uint8)
+        
+        # 2. Separar a las distintas personas usando Componentes Conectados
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(people_mask, connectivity=8)
 
-            Z = np.nanmedian(depth_image[civilian_mask]) 
+        for label_id in range(1, num_labels):
+            # Ignorar manchas menores a 100 píxeles
+            if stats[label_id, cv2.CC_STAT_AREA] < 225:
+                continue
 
-            if not np.isnan(Z) and not np.isinf(Z):
+            # 3. Aislar a esta persona en concreto
+            person_mask = (labels == label_id)
+
+            # 4. Calcular el porcentaje de predicción "civil"
+            total_person_pixels = np.sum(person_mask)
+            civilian_pixels = np.sum(np.logical_and(person_mask, pred == civilian_class_id))
+            ratio_civil = civilian_pixels / total_person_pixels
+
+            # 5. Lógica de clasificación combinada (> 20% es víctima)
+            if ratio_civil > 0.20:
+                texto_etiqueta = "VICTIMA"
+                color_hud = (217, 67, 224) # RGB Magenta para víctimas
+            else:
+                texto_etiqueta = "RESCATISTA"
+                color_hud = (0, 130, 255)  # RGB Naranja para rescatistas
+
+            # Centroide 2D
+            center_x = int(centroids[label_id][0])
+            center_y = int(centroids[label_id][1])
+
+            # 6. Calcular distancia (Z) y ángulos
+            Z = np.nanmedian(depth_image[person_mask])
+
+            if not np.isnan(Z) and not np.isinf(Z) and Z > 0:
                 X = (center_x - cx) * Z / fx
                 Y = (center_y - cy) * Z / fy
                 distancia_real = np.sqrt(X**2 + Y**2 + Z**2)
-
-                # Pintar el HUD
-                cv2.circle(mask_color, (center_x, center_y), 10, (255, 0, 0), -1)
-                cv2.circle(mask_color, (center_x, center_y), 15, (255, 255, 255), 2)
                 
-                texto = f"VICTIMA! D:{distancia_real:.2f}m"
-                cv2.putText(mask_color, texto, (center_x - 70, center_y - 25), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                self.get_logger().info(f"Civilian a {distancia_real:.2f} metros. Relativo: X={X:.2f}, Y={Y:.2f}, Z={Z:.2f}")
+                # Desfase angular
+                angulo_h = np.degrees(np.arctan2(X, Z))
 
+                # 7. Pintar el HUD
+                cv2.circle(mask_color, (center_x, center_y), 5, (255, 255, 255), -1)
+                cv2.circle(mask_color, (center_x, center_y), 10, color_hud, 2)
+                
+                texto_final = f"{texto_etiqueta} D:{distancia_real:.2f}m A:{angulo_h:.1f}deg"
+                cv2.putText(mask_color, texto_final, (center_x - 80, center_y - 20), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                
+                self.get_logger().info(f"[{texto_etiqueta}] Dist: {distancia_real:.2f}m | Ang H: {angulo_h:.1f} | Ratio Civil: {ratio_civil:.2%}")
         # Publicar y terminar
         self.pub.publish(self.bridge.cv2_to_imgmsg(mask_color, "rgb8"))
         
